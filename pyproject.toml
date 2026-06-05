@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cc-tool"
+version = "0.0.1"
+description = "Local credit-card statement categorization tool"
+requires-python = ">=3.9"
+dependencies = [
+  "openai>=1.0",
+  "pdfplumber",
+  "pydantic>=2.0",
+  "python-dotenv",
+]
+
+[project.scripts]
+cc-tool = "cc_tool.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cc_tool"]
