@@ -26,6 +26,14 @@ class TransactionRow(BaseModel):
             "Use 'interest' for interest charges."
         )
     )
+    # Assigned by the separate categorization pass (see categorizer.py), never by
+    # the parser -- it is stripped from the schema handed to the parsing model
+    # (see parse_json_schema). Null until categorized; only 'purchase' rows are
+    # ever assigned a spending category.
+    category: Optional[str] = Field(
+        default=None,
+        description="Spending category from the canonical list, or null.",
+    )
 
 
 class ParseResult(BaseModel):
@@ -37,7 +45,7 @@ class ParseResult(BaseModel):
         description="Total purchases/charges as printed on the statement (often labeled "
         "'Total Purchases', 'New Charges', or 'Total this period'). "
         "This should be the spending total only — do NOT include payments received. "
-        "Integer cents. Null if the statement does not show one.",
+        "Integer cents. Example: $308.44 → 30844. Null if the statement does not show one.",
     )
     issuer: Optional[str] = Field(
         default=None,
@@ -51,3 +59,18 @@ class ParseResult(BaseModel):
         default=None,
         description="End of statement period in ISO format YYYY-MM-DD.",
     )
+
+
+def parse_json_schema() -> dict:
+    """JSON schema for the PARSE step, with the categorization-only `category`
+    field removed from TransactionRow.
+
+    The parser must extract raw transaction facts (date, descriptor, amount,
+    type); the spending category is assigned by a later pass. Handing `category`
+    to the parsing model would invite it to guess categories mid-parse, so we
+    strip it from the schema the model sees.
+    """
+    schema = ParseResult.model_json_schema()
+    row = schema.get("$defs", {}).get("TransactionRow", {})
+    row.get("properties", {}).pop("category", None)
+    return schema

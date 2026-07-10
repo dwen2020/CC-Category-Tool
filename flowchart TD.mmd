@@ -1,0 +1,37 @@
+flowchart TD
+  Upload[PDF Upload]
+  Hash{File hash<br/>seen before?}
+  ParseCache[(Parse Cache<br/>hash → rows)]
+  Parser[LLM Statement Parser<br/>extracts rows + printed total]
+  Recon{Rows sum ==<br/>printed total?}
+  ManualParse[Parse Review<br/>fix rows or override]
+  RawTx[Raw Transactions<br/>date, descriptor, amount]
+  Norm[Merchant Normalizer]
+
+  subgraph Categorization [Categorizer — resolution cascade]
+    direction TB
+    LCache[1. Learned Cache<br/>exact normalized match]
+    Model[2. Model Backend<br/>embedding or LLM]
+    Unknown[3. Uncategorized]
+    LCache -.miss.-> Model -.miss.-> Unknown
+  end
+
+  Store[(Local Storage<br/>statements, transactions,<br/>learned mappings, catalog)]
+  Dashboard[Dashboard<br/>totals per category over time]
+  Review[Uncategorized Review UI<br/>one-click assignment]
+
+  Upload --> Hash
+  Hash -->|hit| ParseCache
+  ParseCache --> RawTx
+  Hash -->|miss| Parser
+  Parser --> Recon
+  Recon -->|match| RawTx
+  Recon -->|mismatch| ManualParse
+  ManualParse --> RawTx
+  RawTx -.write.-> ParseCache
+  RawTx --> Norm
+  Norm --> Categorization
+  Categorization --> Store
+  Store --> Dashboard
+  Store --> Review
+  Review -->|user assignment| LCache

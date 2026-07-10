@@ -1,4 +1,4 @@
-"""StatementParser interface and Ollama implementation.
+"""StatementParser interface and concrete implementations.
 
 Future backends (deterministic per-bank, etc.) implement the same
 StatementParser ABC and slot in without touching the rest of the app."""
@@ -10,83 +10,113 @@ import json
 import os
 from abc import ABC, abstractmethod
 
-from .schema import ParseResult
+from .schema import ParseResult, parse_json_schema
 
 
 PARSE_INSTRUCTIONS = """\
-You are parsing a credit card statement.
+You are parsing a credit card statement. Return a single JSON object. No markdown, no commentary.
 
-Extract every line-item transaction (date, descriptor, amount), the statement's
-printed transactions total if shown, and the issuer name and statement period
-if shown.
+--- FIELD RULES ---
 
-Rules:
-- amount_cents is a SIGNED integer in CENTS. Charges and purchases are POSITIVE.
-  Credits, refunds, and payments received are NEGATIVE.
-- date is ISO format YYYY-MM-DD. If the statement only shows MM/DD, infer the
-  year from the statement period.
-- descriptor is the merchant string exactly as printed, including any store
-  numbers or city/state suffixes. Do not normalize or clean it.
-- Do NOT include summary lines (previous balance, new balance, payment due,
-  minimum payment, available credit) as transactions.
-- Interest charges are transactions only if they appear in the dated
-  transactions list.
-- printed_total_cents is the sum the statement itself prints (commonly labeled
-  "Transactions", "Total Purchases", or "Total this period"). Null if absent.
+date: TRANSACTION date (the "Trans date" column, not "Post date"). Always ISO
+YYYY-MM-DD. Infer the year from the statement period.
+  "Apr 23" in an April-May 2026 statement → "2026-04-23"
 
-Return a single JSON object that conforms to the provided schema. Do not wrap
-it in markdown, do not add commentary.
+descriptor: Merchant name exactly as printed. Include store numbers and
+city/province. EXCLUDE any spend-category label that appears in a separate
+column on the same line (e.g. "Restaurants", "Transportation").
+  "COFFEE SHOP VANCOUVER BC  Restaurants  12.34" → descriptor "COFFEE SHOP VANCOUVER BC"
+
+amount_cents: Signed integer cents. All amounts print as positive in the PDF;
+assign sign by type:
+  purchases / fees / interest / cash advances → POSITIVE  ($18.90 → 1890)
+  cardholder payments / merchant credits / refunds → NEGATIVE  ($529.42 payment → -52942)
+
+transaction_type: "purchase" | "payment" | "refund" | "fee" | "interest"
+
+--- WHAT TO INCLUDE ---
+
+Include ALL dated line items: purchases, payments, fees, credits, interest.
+Cardholder payments ARE transactions — include them.
+EXCLUDE account summary lines: previous balance, new balance, minimum payment
+due, available credit, credit limit.
+
+--- OTHER FIELDS ---
+
+issuer: bank/card name as printed (e.g. "Simplii Financial", "Canadian Tire Bank").
+period_start / period_end: statement period in YYYY-MM-DD.
+printed_total_cents: the single charges total printed for this period — look for
+labels like "Total charges", "Total Purchases", "Total for [card number]", "New Purchases".
+If none of those labels appear, fall back to "New Balance".
+Integer cents. Example: $308.44 → 30844. Null only if no dollar total of any kind is present.
+Do NOT use minimum payment due or available credit.
 """
 
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Extract text from a PDF, preserving rough column layout via pdfplumber's
-    layout=True option. Statements are tabular; layout preservation matters."""
+    """Extract text from a PDF.
+
+    For each page, prefer structured table extraction (less noise for the model).
+    Fall back to layout-preserving text for pages that have no detectable tables
+    (summary sections, headers, etc. that live outside tables).
+    """
     import pdfplumber
 
     pages: list[str] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            text = page.extract_text(layout=True) or ""
-            pages.append(text)
+            tables = page.extract_tables()
+            if tables:
+                rows: list[str] = []
+                for table in tables:
+                    for row in table:
+                        if row and any(cell for cell in row if cell and cell.strip()):
+                            rows.append(" | ".join(cell.strip() if cell else "" for cell in row))
+                pages.append("\n".join(rows))
+            else:
+                pages.append(page.extract_text(layout=True) or "")
     return "\n\n--- PAGE BREAK ---\n\n".join(pages)
 
 
 class StatementParser(ABC):
     @abstractmethod
-    def parse(self, pdf_bytes: bytes) -> ParseResult: ...
+    def parse(self, pdf_bytes: bytes, *, debug: bool = False) -> ParseResult: ...
 
 
-_OLLAMA_BASE_URL = "http://localhost:11434/v1"
+class FuelixStatementParser(StatementParser):
+    """Primary parser — uses the TELUS Fuelix (OpenRouter-compatible) API."""
 
-
-class OllamaStatementParser(StatementParser):
     def __init__(self, model: str | None = None):
-        import httpx
         from openai import OpenAI
 
-        mdl = model or os.environ.get("OLLAMA_MODEL")
+        api_key = os.environ.get("FUELIX_API_KEY")
+        base_url = os.environ.get("FUELIX_BASE_URL")
+        mdl = model or os.environ.get("FUELIX_MODEL")
+
+        if not api_key:
+            raise RuntimeError("FUELIX_API_KEY is not set. Add it to .env.")
+        if not base_url:
+            raise RuntimeError("FUELIX_BASE_URL is not set. Add it to .env.")
         if not mdl:
             raise RuntimeError(
-                "OLLAMA_MODEL is not set. Add it to .env or pass --model."
+                "FUELIX_MODEL is not set. Add it to .env or pass --model."
             )
-        # trust_env=False prevents corporate proxies from intercepting localhost traffic.
-        self._client = OpenAI(
-            api_key="ollama",
-            base_url=_OLLAMA_BASE_URL,
-            http_client=httpx.Client(trust_env=False),
-        )
+
+        self._client = OpenAI(api_key=api_key, base_url=base_url)
         self._model = mdl
 
-    def parse(self, pdf_bytes: bytes) -> ParseResult:
+    def parse(self, pdf_bytes: bytes, *, debug: bool = False) -> ParseResult:
         text = extract_text_from_pdf(pdf_bytes)
-        schema = ParseResult.model_json_schema()
+        schema = parse_json_schema()
 
         system_prompt = (
             PARSE_INSTRUCTIONS
             + "\n\nThe JSON object you return must conform to this schema:\n"
             + json.dumps(schema, indent=2)
         )
+
+        if debug:
+            print(f"[debug] extracted text length: {len(text)} chars (~{len(text)//4} tokens est.)")
 
         response = self._client.chat.completions.create(
             model=self._model,
@@ -105,6 +135,74 @@ class OllamaStatementParser(StatementParser):
         )
 
         content = response.choices[0].message.content
+        if not content:
+            raise RuntimeError("Empty response from model.")
+
+        if debug:
+            usage = response.usage
+            print(f"[debug] prompt_tokens={usage.prompt_tokens}  completion_tokens={usage.completion_tokens}  finish_reason={response.choices[0].finish_reason}")
+            print(f"[debug] raw response (first 2000 chars):\n{content[:2000]}")
+
+        return ParseResult.model_validate_json(content)
+
+
+class OllamaStatementParser(StatementParser):
+    """Local fallback parser — uses a model served by Ollama."""
+
+    # Enough for a full multi-page statement including the system prompt and schema.
+    _NUM_CTX = 32768
+
+    def __init__(self, model: str | None = None):
+        mdl = model or os.environ.get("OLLAMA_MODEL")
+        if not mdl:
+            raise RuntimeError(
+                "OLLAMA_MODEL is not set. Add it to .env or pass --model."
+            )
+        self._model = mdl
+
+    def parse(self, pdf_bytes: bytes, *, debug: bool = False) -> ParseResult:
+        text = extract_text_from_pdf(pdf_bytes)
+        schema = parse_json_schema()
+
+        system_prompt = (
+            PARSE_INSTRUCTIONS
+            + "\n\nThe JSON object you return must conform to this schema:\n"
+            + json.dumps(schema, indent=2)
+        )
+
+        if debug:
+            print(f"[debug] extracted text length: {len(text)} chars (~{len(text)//4} tokens est.)")
+            print(f"[debug] requesting num_ctx={self._NUM_CTX}")
+
+        import ollama
+        # trust_env=False prevents the corporate proxy from intercepting localhost.
+        client = ollama.Client(host="http://localhost:11434", trust_env=False)
+        response = client.chat(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        "Below is the text extracted from a credit card "
+                        "statement PDF. Parse it.\n\n"
+                        f"{text}"
+                    ),
+                },
+            ],
+            format=schema,
+            options={"num_ctx": self._NUM_CTX},
+        )
+
+        if debug:
+            print(
+                f"[debug] prompt_tokens={response.prompt_eval_count}"
+                f"  completion_tokens={response.eval_count}"
+                f"  done_reason={response.done_reason}"
+            )
+            print(f"[debug] raw response (first 2000 chars):\n{response.message.content[:2000]}")
+
+        content = response.message.content
         if not content:
             raise RuntimeError("Empty response from model.")
         return ParseResult.model_validate_json(content)

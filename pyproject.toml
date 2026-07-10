@@ -9,6 +9,7 @@ description = "Local credit-card statement categorization tool"
 requires-python = ">=3.9"
 dependencies = [
   "openai>=1.0",
+  "ollama>=0.3",
   "pdfplumber",
   "pydantic>=2.0",
   "python-dotenv",
