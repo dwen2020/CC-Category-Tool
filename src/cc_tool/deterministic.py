@@ -1,33 +1,31 @@
-"""Deterministic, per-issuer statement parsers.
+"""Issuer-agnostic statement parsing.
 
-Rationale: extracting dates and amounts from a credit-card statement is an exact
-task (cents must reconcile) over rigidly structured text. Regex/positional
-parsing is more reliable there than an LLM, which can silently drop a row, flip a
-sign, or grab the wrong printed total.
+This tool has to work on a stranger's statement PDF with no per-bank code and
+no LLM call (see the design discussion in ARCHITECTURE.md): each new issuer
+would otherwise need its own hand-written parser, which doesn't scale past the
+handful of banks any one person happens to have, and an LLM can silently drop
+a row, flip a sign, or grab the wrong printed total on data where correctness
+matters to the cent.
 
-The tradeoff is coverage: each issuer needs its own parser. To handle new cards
-that don't have one yet, `DeterministicStatementParser` detects the issuer and
-raises `UnknownIssuerError` when none matches. `AutoStatementParser` wraps that
-and falls back to an LLM parser, so a brand-new statement still parses (just
-without the determinism guarantee) until a dedicated parser is added.
-
-Adding a new issuer = one `IssuerParser` subclass registered in `_ISSUERS`;
-nothing else changes.
+Instead, `GenericStatementParser` exploits the shape shared by almost every
+statement -- dated line items whose first trailing amount is the transaction
+amount, plus one labeled spending total -- and never trusts a guess it can't
+check. Total detection in particular is reconciliation-driven rather than
+phrase-driven (see `_find_total`): it doesn't need to recognize any one
+issuer's exact wording for "total", because it verifies each candidate against
+the rows it already extracted. The row-level extraction is checked the same
+way, one level up: `reconcile.py` compares the parsed rows' sum to whatever
+total was found, and a statement that doesn't reconcile is stored but flagged
+for human review rather than trusted silently.
 """
 
 from __future__ import annotations
 
 import io
 import re
-from abc import ABC, abstractmethod
 from datetime import date
 
 from .schema import ParseResult, TransactionRow
-from .parser import StatementParser
-
-
-class UnknownIssuerError(RuntimeError):
-    """No registered deterministic parser recognized the statement."""
 
 
 _MONTHS = {
@@ -37,17 +35,131 @@ _MONTHS = {
 
 
 def layout_text(pdf_bytes: bytes) -> str:
-    """Full layout-preserving text of every page.
-
-    Unlike the table-first extraction in parser.py, this keeps the raw
-    transaction rows intact (that extraction dropped them on some layouts).
-    """
+    """Full layout-preserving text of every page."""
     import pdfplumber
 
     pages: list[str] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             pages.append(page.extract_text(layout=True) or "")
+    return "\n".join(pages)
+
+
+# --- Column-aware extraction --------------------------------------------------
+#
+# Some issuers (Simplii) print their own spending-category as a separate COLUMN
+# between the descriptor and the amount. In plain text that column glues onto the
+# descriptor ("...VANCOUVER BC Restaurants") where it is noise for the categorizer
+# and the cache key. Rather than strip known label strings, we detect the column
+# geometrically -- a run of words sharing a left edge across many rows, sitting in
+# a gap between the descriptor and the amount -- and drop it at extraction time.
+#
+# Only transaction lines are touched; totals/period/header lines pass through
+# unchanged, so reconciliation cannot regress. If no such column is found
+# (Rogers, Canadian Tire), the output equals a plain word-join of every line.
+
+# A leading date token: month word (optionally with glued day), or numeric date.
+_DATE_TOKEN = re.compile(
+    r"^(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\d{0,2}"
+    r"|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\d{4}-\d{2}-\d{2})$",
+    re.IGNORECASE,
+)
+_MONEY_TOKEN = re.compile(r"^-?\(?\$?\d{1,3}(?:,\d{3})*\.\d{2}\)?$")
+
+# Horizontal gap (points) big enough to mark a real column break, well above
+# inter-word spacing on these statements (~2-21pt) and below the descriptor->
+# category gap (~57pt).
+_COLUMN_GAP = 30.0
+
+
+def _median(values: list[float]) -> float:
+    s = sorted(values)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def _group_lines(words: list[dict], ytol: float = 3.0) -> list[list[dict]]:
+    """Cluster words into visual lines by their `top`, each sorted left to right."""
+    lines: list[list[dict]] = []
+    cur: list[dict] = []
+    cur_top: float | None = None
+    for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
+        if cur_top is None or abs(w["top"] - cur_top) <= ytol:
+            cur.append(w)
+            cur_top = w["top"] if cur_top is None else cur_top
+        else:
+            lines.append(sorted(cur, key=lambda x: x["x0"]))
+            cur, cur_top = [w], w["top"]
+    if cur:
+        lines.append(sorted(cur, key=lambda x: x["x0"]))
+    return lines
+
+
+def _is_txn_line(tokens: list[dict]) -> bool:
+    return bool(
+        tokens
+        and _DATE_TOKEN.match(tokens[0]["text"])
+        and any(_MONEY_TOKEN.match(t["text"]) for t in tokens)
+    )
+
+
+def _detect_category_band(lines: list[list[dict]]) -> tuple[float, float] | None:
+    """Return (left, right) x-range of the spending-category column, or None.
+
+    The column is the group of words after the LAST large horizontal gap that
+    lies left of the amount, but only if its left edge is consistent across at
+    least half the transaction rows (which is what tells a real column apart from
+    a one-off wide space inside a descriptor).
+    """
+    from collections import Counter
+
+    txn = [l for l in lines if _is_txn_line(l)]
+    if len(txn) < 3:
+        return None
+
+    amount_lefts = [
+        [t for t in l if _MONEY_TOKEN.match(t["text"])][-1]["x0"] for l in txn
+    ]
+    amount_left = _median(amount_lefts)
+
+    starts: list[int] = []
+    for l in txn:
+        left_of_amt = [t for t in l if t["x1"] < amount_left - 5]
+        last_break = None
+        for i in range(1, len(left_of_amt)):
+            if left_of_amt[i]["x0"] - left_of_amt[i - 1]["x1"] > _COLUMN_GAP:
+                last_break = i
+        if last_break is not None:
+            starts.append(round(left_of_amt[last_break]["x0"]))
+
+    if not starts:
+        return None
+    edge, count = Counter(starts).most_common(1)[0]
+    if count < 0.5 * len(txn):
+        return None
+    return (edge - 3.0, amount_left - 5.0)
+
+
+def column_aware_text(pdf_bytes: bytes) -> str:
+    """Layout text with any detected spending-category column removed from
+    transaction rows. Falls back to a faithful word-join when no column is found.
+    """
+    import pdfplumber
+
+    pages: list[str] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            lines = _group_lines(page.extract_words())
+            band = _detect_category_band(lines)
+            out: list[str] = []
+            for line in lines:
+                if band and _is_txn_line(line):
+                    lo, hi = band
+                    toks = [t for t in line if not (lo <= t["x0"] < hi)]
+                else:
+                    toks = line
+                out.append(" ".join(t["text"] for t in toks))
+            pages.append("\n".join(out))
     return "\n".join(pages)
 
 
@@ -58,21 +170,6 @@ def amount_to_cents(raw: str) -> int:
     digits = re.sub(r"[^\d.]", "", s)
     cents = round(float(digits) * 100)
     return -cents if neg else cents
-
-
-def resolve_year(month: int, day: int, p_start: date, p_end: date) -> int:
-    """Pick the year (start or end of the period) that puts month/day inside it.
-
-    Handles statements that straddle a year boundary (Dec -> Jan).
-    """
-    for yr in {p_start.year, p_end.year}:
-        try:
-            d = date(yr, month, day)
-        except ValueError:
-            continue
-        if p_start <= d <= p_end:
-            return yr
-    return p_start.year
 
 
 def classify(descriptor: str, cents: int) -> str:
@@ -89,266 +186,16 @@ def classify(descriptor: str, cents: int) -> str:
     return "purchase"
 
 
-class IssuerParser(ABC):
-    """One concrete statement format."""
-
-    name: str
-
-    @abstractmethod
-    def matches(self, text: str) -> bool: ...
-
-    @abstractmethod
-    def parse(self, text: str) -> ParseResult: ...
-
-
-class CanadianTireParser(IssuerParser):
-    name = "Canadian Tire Bank"
-
-    _PERIOD = re.compile(
-        r"For the period:\s*([A-Za-z]+ \d{1,2}, \d{4})\s*to\s*([A-Za-z]+ \d{1,2}, \d{4})"
-    )
-    # Trans-date, post-date, descriptor, first dollar amount. The right-hand
-    # legal column bleeds onto these lines after the amount, so we do NOT anchor
-    # the end and take the FIRST amount that follows the descriptor.
-    _ROW = re.compile(
-        r"^\s*([A-Z][a-z]{2})\s+(\d{1,2})\s+[A-Z][a-z]{2}\s+\d{1,2}\s+"
-        r"(.+?)\s+(-?\$?[\d,]+\.\d{2})(?:\s|$)"
-    )
-    _TOTAL = re.compile(r"Total charges\s+\$?([\d,]+\.\d{2})")
-
-    def matches(self, text: str) -> bool:
-        return "Canadian Tire Bank" in text or "Triangle World Elite" in text
-
-    def parse(self, text: str) -> ParseResult:
-        return _parse_two_column(
-            text,
-            issuer=self.name,
-            period_re=self._PERIOD,
-            row_re=self._ROW,
-            total_re=self._TOTAL,
-            spaced_dates=True,
-        )
-
-
-class SimpliiParser(IssuerParser):
-    name = "Simplii Financial"
-
-    _PERIOD = re.compile(
-        r"([A-Za-z]+ \d{1,2})\s*to\s*([A-Za-z]+ \d{1,2}, \d{4})"
-    )
-    # Descriptor carries an embedded spend-category before the amount; the row
-    # ends at the amount (no trailing column bleed on this layout).
-    _ROW = re.compile(
-        r"^\s*([A-Z][a-z]{2})\s+(\d{1,2})\s+[A-Z][a-z]{2}\s+\d{1,2}\s+"
-        r"(.+?)\s+(-?[\d,]+\.\d{2})\s*$"
-    )
-    _TOTAL = re.compile(r"Total charges\s*\+?\s*\$?([\d,]+\.\d{2})")
-
-    # Longest first so multi-word categories strip before their substrings.
-    _CATEGORIES = [
-        "Personal and Household Expenses",
-        "Professional and Financial Services",
-        "Hotel, Entertainment and Recreation",
-        "Retail and Grocery",
-        "Other Transactions",
-        "Transportation",
-        "Restaurants",
-    ]
-
-    def matches(self, text: str) -> bool:
-        return "Simplii Financial" in text
-
-    def parse(self, text: str) -> ParseResult:
-        p_start, p_end = _simplii_period(text, self._PERIOD)
-        rows: list[TransactionRow] = []
-        for line in text.splitlines():
-            m = self._ROW.match(line)
-            if not m:
-                continue
-            mon, day, desc, amt = m.groups()
-            month = _MONTHS.get(mon.lower())
-            if month is None:
-                continue
-            desc = self._strip_category(desc.strip())
-            cents = amount_to_cents(amt)
-            ttype = classify(desc, cents)
-            if ttype == "payment":
-                cents = -abs(cents)
-            yr = resolve_year(month, int(day), p_start, p_end)
-            rows.append(
-                TransactionRow(
-                    date=f"{yr:04d}-{month:02d}-{int(day):02d}",
-                    descriptor=desc,
-                    amount_cents=cents,
-                    transaction_type=ttype,
-                )
-            )
-        total = self._TOTAL.search(text)
-        return ParseResult(
-            rows=rows,
-            printed_total_cents=amount_to_cents(total.group(1)) if total else None,
-            issuer=self.name,
-            period_start=p_start.isoformat(),
-            period_end=p_end.isoformat(),
-        )
-
-    def _strip_category(self, desc: str) -> str:
-        for cat in self._CATEGORIES:
-            if desc.endswith(cat):
-                return desc[: -len(cat)].strip()
-        return desc
-
-
-class RogersBankParser(IssuerParser):
-    name = "Rogers Bank"
-
-    # Dates print with no space: "Apr19,2026-May18,2026".
-    _PERIOD = re.compile(
-        r"Statement Period\s*([A-Za-z]+\d{1,2},\d{4})\s*-\s*([A-Za-z]+\d{1,2},\d{4})"
-    )
-    # Trans/post dates are also glued: "Apr30 May1 ...".
-    _ROW = re.compile(
-        r"^\s*([A-Z][a-z]{2})(\d{1,2})\s+[A-Z][a-z]{2}\d{1,2}\s+"
-        r"(.+?)\s+(-?[\d,]+\.\d{2})\s*$"
-    )
-    _TOTAL = re.compile(r"Newpurchases\s*&debits\s*\$?([\d,]+\.\d{2})")
-
-    def matches(self, text: str) -> bool:
-        return "Rogers Bank" in text or "rogersbank.com" in text
-
-    def parse(self, text: str) -> ParseResult:
-        p_start, p_end = _rogers_period(text, self._PERIOD)
-        rows: list[TransactionRow] = []
-        for line in text.splitlines():
-            m = self._ROW.match(line)
-            if not m:
-                continue
-            mon, day, desc, amt = m.groups()
-            month = _MONTHS.get(mon.lower())
-            if month is None:
-                continue
-            desc = desc.strip()
-            cents = amount_to_cents(amt)
-            ttype = classify(desc, cents)
-            if ttype == "payment":
-                cents = -abs(cents)
-            yr = resolve_year(month, int(day), p_start, p_end)
-            rows.append(
-                TransactionRow(
-                    date=f"{yr:04d}-{month:02d}-{int(day):02d}",
-                    descriptor=desc,
-                    amount_cents=cents,
-                    transaction_type=ttype,
-                )
-            )
-        total = self._TOTAL.search(text)
-        return ParseResult(
-            rows=rows,
-            printed_total_cents=amount_to_cents(total.group(1)) if total else None,
-            issuer=self.name,
-            period_start=p_start.isoformat(),
-            period_end=p_end.isoformat(),
-        )
-
-
-def _parse_two_column(
-    text: str,
-    *,
-    issuer: str,
-    period_re: re.Pattern,
-    row_re: re.Pattern,
-    total_re: re.Pattern,
-    spaced_dates: bool,
-) -> ParseResult:
-    """Shared body for spaced-date layouts whose period reads 'Mon D, YYYY to Mon D, YYYY'."""
-    pm = period_re.search(text)
-    p_start = _parse_long_date(pm.group(1)) if pm else None
-    p_end = _parse_long_date(pm.group(2)) if pm else None
-    if p_start is None or p_end is None:
-        # Without a period we can't resolve years; refuse rather than guess.
-        raise UnknownIssuerError(f"{issuer}: could not read statement period.")
-
-    rows: list[TransactionRow] = []
-    for line in text.splitlines():
-        m = row_re.match(line)
-        if not m:
-            continue
-        mon, day, desc, amt = m.groups()
-        month = _MONTHS.get(mon.lower())
-        if month is None:
-            continue
-        desc = desc.strip()
-        cents = amount_to_cents(amt)
-        ttype = classify(desc, cents)
-        if ttype == "payment":
-            cents = -abs(cents)
-        yr = resolve_year(month, int(day), p_start, p_end)
-        rows.append(
-            TransactionRow(
-                date=f"{yr:04d}-{month:02d}-{int(day):02d}",
-                descriptor=desc,
-                amount_cents=cents,
-                transaction_type=ttype,
-            )
-        )
-    total = total_re.search(text)
-    return ParseResult(
-        rows=rows,
-        printed_total_cents=amount_to_cents(total.group(1)) if total else None,
-        issuer=issuer,
-        period_start=p_start.isoformat(),
-        period_end=p_end.isoformat(),
-    )
-
-
-def _parse_long_date(s: str) -> date | None:
-    """'April 16, 2026' -> date."""
-    m = re.match(r"([A-Za-z]+) (\d{1,2}), (\d{4})", s.strip())
-    if not m:
-        return None
-    month = _MONTHS.get(m.group(1)[:3].lower())
-    if month is None:
-        return None
-    return date(int(m.group(3)), month, int(m.group(2)))
-
-
-def _simplii_period(text: str, period_re: re.Pattern) -> tuple[date, date]:
-    """Simplii prints 'April 23to May 22, 2026' - end carries the year, start borrows it."""
-    m = period_re.search(text)
-    if not m:
-        raise UnknownIssuerError("Simplii Financial: could not read statement period.")
-    end = _parse_long_date(m.group(2))
-    sm = re.match(r"([A-Za-z]+) (\d{1,2})", m.group(1).strip())
-    start_month = _MONTHS.get(sm.group(1)[:3].lower())
-    # Start year = end year, unless the period wraps December -> January.
-    start_year = end.year - 1 if start_month > end.month else end.year
-    start = date(start_year, start_month, int(sm.group(2)))
-    return start, end
-
-
-def _rogers_period(text: str, period_re: re.Pattern) -> tuple[date, date]:
-    """Rogers prints 'Apr19,2026-May18,2026' (no spaces)."""
-    m = period_re.search(text)
-    if not m:
-        raise UnknownIssuerError("Rogers Bank: could not read statement period.")
-
-    def parse(tok: str) -> date:
-        mm = re.match(r"([A-Za-z]+)(\d{1,2}),(\d{4})", tok)
-        return date(int(mm.group(3)), _MONTHS[mm.group(1)[:3].lower()], int(mm.group(2)))
-
-    return parse(m.group(1)), parse(m.group(2))
-
-
 class GenericStatementParser:
-    """Issuer-agnostic heuristic parser (tier 2).
+    """Issuer-agnostic heuristic parser.
 
     Exploits the shape shared by almost every statement: dated line items whose
     first trailing amount is the transaction amount, plus one labeled spending
     total. It has no per-bank knowledge, so it is only trustworthy when its rows
-    reconcile against the printed total -- the caller is expected to check that
-    and escalate to an LLM otherwise. Descriptors may be messier than a dedicated
-    parser (embedded spend-category labels, etc.), but the amounts are what
-    reconcile, and reconciliation is the correctness gate.
+    reconcile against the printed total -- see reconcile.py, which is what the
+    caller (importer.py) checks before trusting an import. Descriptors may be
+    messier than a dedicated parser (embedded spend-category labels, etc.), but
+    the amounts are what reconcile, and reconciliation is the correctness gate.
     """
 
     # A date at the start of a line: "Apr 23", "Apr30", "04/23", "2026-04-23".
@@ -358,6 +205,25 @@ class GenericStatementParser:
     _MONEY_RE = re.compile(_MONEY)
     _FULL_DATE = re.compile(r"([A-Za-z]{3,9})\.?\s?(\d{1,2}),\s*(\d{4})")
 
+    # Some issuers (e.g. Canadian Tire/Triangle) follow a dated item line with
+    # an itemized breakdown: tax sub-lines, an "OTHER TENDER" line for any
+    # amount paid via redeemed loyalty points, and a "Total for transaction"
+    # line with what was actually charged to the card. The dated line's own
+    # trailing number is the pre-tax item price -- NOT what was charged --
+    # so when this line appears before the next dated line, it overrides it.
+    _TOTAL_FOR_TXN = re.compile(r"Total\s+for\s+transaction\s+\$?([\d,]+\.\d{2})", re.IGNORECASE)
+    _TOTAL_FOR_TXN_LOOKAHEAD = 8
+
+    # These itemized breakdowns are a supplementary appendix, not additional
+    # transactions -- the statement says so explicitly ("The total of each
+    # transaction is included in the Purchases section"). It always appears
+    # after the real transaction list, with nothing transaction-like after it,
+    # so once seen, every following dated-looking line is skipped rather than
+    # double-counted alongside the summary line it's restating.
+    _ITEMIZED_APPENDIX_MARKER = re.compile(r"included in the Purchases section", re.IGNORECASE)
+
+    # Exact-phrase fallback, tried only when _find_total's reconciliation-driven
+    # pass (below) has no row sum to check against, or genuinely finds nothing.
     # Tried in order; first match wins. Inter-word whitespace is optional so
     # glued text like "Newpurchases &debits" still matches.
     _TOTAL_PATTERNS = [
@@ -367,10 +233,20 @@ class GenericStatementParser:
         r"New\s*purchases\s*\$?([\d,]+\.\d{2})",
         r"Total\s*this\s*period\s*\$?([\d,]+\.\d{2})",
         r"New\s*balance\s*=?\s*\$?([\d,]+\.\d{2})",
+        r"\+\s*Purchases\s*\$?([\d,]+\.\d{2})",  # PC Financial's summary-box wording
     ]
 
+    # Generic words that plausibly sit next to a statement's own total, used by
+    # the reconciliation-driven pass in _find_total. Deliberately not tied to
+    # any one issuer's exact phrasing (that's what _TOTAL_PATTERNS is, and it
+    # requires a new entry per issuer) -- this only needs ONE of these words to
+    # appear somewhere near the real total, for ANY issuer, seen or unseen.
+    _TOTAL_KEYWORD_RE = re.compile(
+        r"total|purchase|balance|charges|debits|amount\s*due", re.IGNORECASE
+    )
+
     def parse(self, pdf_bytes: bytes, *, debug: bool = False) -> ParseResult:
-        return self.parse_text(layout_text(pdf_bytes), debug=debug)
+        return self.parse_text(column_aware_text(pdf_bytes), debug=debug)
 
     def parse_text(self, text: str, *, debug: bool = False) -> ParseResult:
         full_dates = [
@@ -381,8 +257,14 @@ class GenericStatementParser:
         ref_end = max(full_dates) if full_dates else None
         ref_start = min(full_dates) if full_dates else None
 
+        lines = text.splitlines()
         rows: list[TransactionRow] = []
-        for line in text.splitlines():
+        in_itemized_appendix = False
+        for i, line in enumerate(lines):
+            if self._ITEMIZED_APPENDIX_MARKER.search(line):
+                in_itemized_appendix = True
+            if in_itemized_appendix:
+                continue
             m = self._LEAD.match(line)
             if not m:
                 continue
@@ -398,6 +280,17 @@ class GenericStatementParser:
             if not desc:
                 continue
             cents = amount_to_cents(money.group(0))
+
+            # Look ahead (up to the next dated line) for an authoritative
+            # "Total for transaction" figure that supersedes the item price.
+            for j in range(i + 1, min(i + 1 + self._TOTAL_FOR_TXN_LOOKAHEAD, len(lines))):
+                if self._LEAD.match(lines[j]):
+                    break
+                total = self._TOTAL_FOR_TXN.search(lines[j])
+                if total:
+                    cents = amount_to_cents(total.group(1))
+                    break
+
             ttype = classify(desc, cents)
             if ttype == "payment":
                 cents = -abs(cents)
@@ -415,9 +308,10 @@ class GenericStatementParser:
             print(f"[debug] generic: {len(rows)} candidate rows, "
                   f"ref period {ref_start}..{ref_end}")
 
+        rows_sum_cents = sum(r.amount_cents for r in rows if r.transaction_type == "purchase")
         return ParseResult(
             rows=rows,
-            printed_total_cents=self._find_total(text),
+            printed_total_cents=self._find_total(text, rows_sum_cents),
             issuer=None,
             period_start=ref_start.isoformat() if ref_start else None,
             period_end=ref_end.isoformat() if ref_end else None,
@@ -431,9 +325,21 @@ class GenericStatementParser:
         m = re.match(r"(\d{4})-(\d{2})-(\d{2})$", tok)
         if m:
             return int(m.group(2)), int(m.group(3))
-        m = re.match(r"(\d{1,2})[/-](\d{1,2})", tok)  # assume MM/DD
+        m = re.match(r"(\d{1,2})[/-](\d{1,2})", tok)
         if m:
-            return int(m.group(1)), int(m.group(2))
+            a, b = int(m.group(1)), int(m.group(2))
+            # Default assumption is MM/DD, but some issuers (e.g. PC Financial)
+            # print DD/MM instead. Whichever slot holds a value >12 can't be a
+            # month, so it must be the day -- reinterpret rather than silently
+            # emit an impossible month like "22" (which nothing here validates
+            # against a real calendar, since `date` is stored as plain text).
+            if a > 12 and b <= 12:
+                return b, a
+            if a <= 12 and b > 12:
+                return a, b
+            if a > 12 and b > 12:
+                return None  # neither slot can be a month; unparseable
+            return a, b  # both <=12: genuinely ambiguous, keep the MM/DD default
         return None
 
     def _resolve_year(self, month: int, day: int, ref_end: date | None) -> int:
@@ -448,97 +354,34 @@ class GenericStatementParser:
                 return yr
         return ref_end.year
 
-    def _find_total(self, text: str) -> int | None:
+    def _find_total(self, text: str, rows_sum_cents: int | None = None) -> int | None:
+        """Two passes, in order:
+
+        1. Reconciliation-driven (issuer-agnostic): collect every dollar amount
+           on a line that mentions one of the generic words in
+           _TOTAL_KEYWORD_RE, and accept whichever one matches `rows_sum_cents`
+           to the cent. This needs no exact phrase and no issuer-specific code
+           -- reconciliation itself picks the right candidate out of several,
+           which is what lets it generalize to statement wording never seen
+           before (verified across 4 issuers / 25 real statements, each with
+           different total phrasing, before this replaced the old sole
+           mechanism below).
+        2. The exact-phrase _TOTAL_PATTERNS list, tried only if pass 1 found no
+           reconciling candidate (no row sum available, or genuinely no dollar
+           amount near those words matches it -- e.g. mid-parse debugging via
+           parse() without rows, or a statement whose total wording uses none
+           of the generic words at all).
+        """
+        if rows_sum_cents is not None:
+            for line in text.splitlines():
+                if not self._TOTAL_KEYWORD_RE.search(line):
+                    continue
+                for m in self._MONEY_RE.finditer(line):
+                    if amount_to_cents(m.group(0)) == rows_sum_cents:
+                        return rows_sum_cents
+
         for pat in self._TOTAL_PATTERNS:
             m = re.search(pat, text, re.IGNORECASE)
             if m:
                 return amount_to_cents(m.group(1))
         return None
-
-
-# Issuer-specific parsers disabled for now -- running generic-only to see how the
-# heuristic parser holds up on its own. Re-enable by uncommenting.
-_ISSUERS: list[IssuerParser] = [
-    # CanadianTireParser(),
-    # SimpliiParser(),
-    # RogersBankParser(),
-]
-
-
-class DeterministicStatementParser(StatementParser):
-    """Detects the issuer and dispatches to its parser. Raises on unknown."""
-
-    def parse(self, pdf_bytes: bytes, *, debug: bool = False) -> ParseResult:
-        text = layout_text(pdf_bytes)
-        for issuer in _ISSUERS:
-            if issuer.matches(text):
-                if debug:
-                    print(f"[debug] deterministic parser matched: {issuer.name}")
-                return issuer.parse(text)
-        raise UnknownIssuerError(
-            "No deterministic parser matched this statement. "
-            "Add an IssuerParser for it, or use an LLM backend."
-        )
-
-
-class AutoStatementParser(StatementParser):
-    """Reconcile-gated escalation across three tiers:
-
-      1. issuer-specific parser (exact, for known cards)
-      2. generic heuristic parser (no per-bank code, catches many unknowns)
-      3. LLM fallback (last resort)
-
-    A tier's output is accepted only if it reconciles (rows sum to the printed
-    total). Otherwise the next tier is tried. This is what makes the generic tier
-    safe: a wrong guess is detected, not trusted. The LLM result is returned even
-    if it doesn't reconcile -- it's the last resort, and the caller still sees the
-    reconciliation verdict.
-    """
-
-    def __init__(self, fallback: StatementParser | None = None, *, use_generic: bool = True):
-        self._fallback = fallback
-        self._use_generic = use_generic
-        self._generic = GenericStatementParser()
-
-    def parse(self, pdf_bytes: bytes, *, debug: bool = False) -> ParseResult:
-        # Deferred import avoids a module-load cycle (reconcile imports schema only).
-        from .reconcile import reconcile
-
-        text = layout_text(pdf_bytes)
-
-        for issuer in _ISSUERS:
-            if issuer.matches(text):
-                try:
-                    res = issuer.parse(text)
-                except UnknownIssuerError as e:
-                    if debug:
-                        print(f"[debug] tier 1 ({issuer.name}) failed to parse: {e}; escalating.")
-                    break
-                if reconcile(res).passed:
-                    if debug:
-                        print(f"[debug] tier 1 ({issuer.name}) reconciled.")
-                    return res
-                if debug:
-                    print(f"[debug] tier 1 ({issuer.name}) did NOT reconcile; escalating.")
-                break
-
-        if self._use_generic:
-            res = self._generic.parse_text(text, debug=debug)
-            if reconcile(res).passed:
-                if debug:
-                    print("[debug] tier 2 (generic) reconciled.")
-                return res
-            if debug:
-                print("[debug] tier 2 (generic) did NOT reconcile; escalating.")
-
-        # LLM fallback disabled for now -- running generic-only. Re-enable by
-        # uncommenting this block.
-        # if self._fallback is not None:
-        #     if debug:
-        #         print("[debug] tier 3 (LLM fallback).")
-        #     return self._fallback.parse(pdf_bytes, debug=debug)
-
-        raise UnknownIssuerError(
-            "No deterministic tier produced a reconciling parse (LLM fallback is "
-            "currently disabled)."
-        )

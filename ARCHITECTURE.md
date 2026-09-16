@@ -1,151 +1,172 @@
-# Architecture
+# cc-tool architecture
 
-Stack-neutral component view of the credit-card category tool. No language, framework,
-or library names appear here — those are deferred to a follow-up design. The goal of
-this document is a shared mental model of the components and the seams between them.
+A local, single-user tool that turns credit-card statement PDFs into an
+accumulating, categorized spending history. Runs entirely on your machine:
+no account, no cloud dependency, no API key required for the core flow.
 
-## Component diagram
+## Pipeline
 
-```mermaid
-flowchart TD
-  Upload[PDF Upload]
-  Hash{File hash<br/>seen before?}
-  ParseCache[(Parse Cache<br/>hash → rows)]
-  Parser[LLM Statement Parser<br/>extracts rows + printed total]
-  Recon{Rows sum ==<br/>printed total?}
-  ManualParse[Parse Review<br/>fix rows or override]
-  RawTx[Raw Transactions<br/>date, descriptor, amount]
-  Norm[Merchant Normalizer]
-
-  subgraph Categorization [Categorizer — resolution cascade]
-    direction TB
-    LCache[1. Learned Cache<br/>exact normalized match]
-    Model[2. Model Backend<br/>embedding or LLM]
-    Unknown[3. Uncategorized]
-    LCache -.miss.-> Model -.miss.-> Unknown
-  end
-
-  Store[(Local Storage<br/>statements, transactions,<br/>learned mappings, catalog)]
-  Dashboard[Dashboard<br/>totals per category over time]
-  Review[Uncategorized Review UI<br/>one-click assignment]
-
-  Upload --> Hash
-  Hash -->|hit| ParseCache
-  ParseCache --> RawTx
-  Hash -->|miss| Parser
-  Parser --> Recon
-  Recon -->|match| RawTx
-  Recon -->|mismatch| ManualParse
-  ManualParse --> RawTx
-  RawTx -.write.-> ParseCache
-  RawTx --> Norm
-  Norm --> Categorization
-  Categorization --> Store
-  Store --> Dashboard
-  Store --> Review
-  Review -->|user assignment| LCache
+```
+PDF --> parse --> reconcile --> categorize --> store --> dashboard
 ```
 
-## Components
+1. **Parse** (`deterministic.py`): extracts transaction rows (date,
+   descriptor, amount, type) from a statement PDF, via `GenericStatementParser`
+   -- the only parser this tool has, by design (see "Why no per-issuer
+   parsers, no LLM" below). Total detection is reconciliation-driven rather
+   than phrase-matched: `_find_total` collects every dollar amount sitting
+   near a generic keyword (total/purchase/balance/charges/debits/amount due)
+   and accepts whichever one matches the already-extracted rows' sum to the
+   cent, so a brand-new issuer's own wording for "total" doesn't need to be
+   known in advance. A small exact-phrase list (`_TOTAL_PATTERNS`) is kept as
+   a fallback for the rare case where nothing near those keywords reconciles.
+2. **Reconcile** (`reconcile.py`): sums the parsed `purchase` rows only (not
+   refunds or payments -- the issuer's own printed total is a purchases-only
+   figure, so comparing anything else against it produces false failures) and
+   checks that sum against the statement's printed total. A statement that
+   fails reconciliation is still stored, but flagged for review rather than
+   trusted silently.
+3. **Categorize** (`categorizer.py`): a local `distilbert-base-uncased`
+   classifier, fine-tuned on real merchant descriptors
+   (`training/distilbert-uncased-trainer.ipynb`), assigns a spending category to every
+   `purchase` row plus a confidence score (its softmax probability). A
+   per-merchant cache sits in front of it as pure memoization -- classify a
+   normalized merchant once, reuse the answer forever (or until a user
+   override replaces it).
+4. **Store** (`storage.py`): a single local SQLite file. `statements`
+   (deduped by content hash) and `transactions` accumulate across every PDF
+   ever imported, which is what makes month-over-month reporting possible.
+   `learned_categories` is the current per-merchant answer, with a source
+   precedence of `seed < model < user` -- a user correction is never
+   silently overwritten by a later model guess.
+5. **Dashboard** (`webapp.py` + `static/index.html`): a FastAPI app serving
+   one static page. Shows category totals by month across the full history,
+   an activity feed of import progress, and the "All merchants" browser.
 
-- **PDF Upload** — entry point for one or more statement PDFs. Records the source file
-  and hands bytes to the hashing step.
-- **File Hash** — content hash of the uploaded PDF. Used as the parse-cache key so the
-  same file re-imported is free and reproducible.
-- **Parse Cache** — `hash → extracted rows + printed total`. On a hit, the LLM parser is
-  skipped entirely; on a miss, results are written here after reconciliation passes.
-  Makes re-imports offline and deterministic.
-- **LLM Statement Parser** — single implementation of the `StatementParser` interface.
-  Sends statement text to a model and asks for a strict schema:
-  `{rows: [{date, descriptor, amount}], printed_total: <number>}`. Knows nothing about
-  specific banks — relies on the model to handle layout differences.
-- **Reconciliation** — sums the extracted rows and compares against the parser's
-  `printed_total` (within a small tolerance, e.g. one cent). Gates acceptance: only
-  reconciled parses flow downstream. Turns the LLM's silent-failure mode (dropped row,
-  hallucinated row, merged rows) into a loud, gated one.
-- **Parse Review** — surfaces mismatched parses to the user with rows + claimed total +
-  delta. User can fix rows manually or accept as-is (e.g., if the printed total includes
-  fees the user wants categorized separately). Manual fixes write back to the parse
-  cache so the same statement doesn't re-trigger the LLM.
-- **Merchant Normalizer** — single source of truth for cleaning descriptor strings
-  (strip store numbers, city/state, common POS prefixes, casing). Used by both the
-  learned cache and fuzzy match — divergence would silently break categorization.
-- **Categorizer (resolution cascade)** — one `Categorizer` interface,
-  `string -> category`. Three layers; first hit wins:
-  1. Learned cache — exact normalized merchant → category. Highest priority so manual
-     corrections always win and any given merchant is classified at most once.
-  2. Model backend — embedding similarity or LLM classification. Invoked only for
-     cache misses; the cache bounds how often this runs.
-  3. Uncategorized — surfaced to the review UI for one-click assignment.
+## Ingestion
 
-  Rule-based and fuzzy-match layers were considered and intentionally left out.
-  Rules are belt-and-suspenders that the cache + model combination subsumes after one
-  round of user corrections. Fuzzy match is a degenerate form of embedding similarity
-  (string distance vs semantic distance) and is redundant when a model backend is
-  present. Either can be added later if a concrete need surfaces.
-- **Local Storage** — persists statements, transactions (with resolved category), the
-  learned merchant→category mapping, the parse cache, and the canonical category
-  catalog.
-- **Dashboard** — totals per category over time, drill-down to transactions.
-- **Uncategorized Review UI** — one-click categorization for unknown merchants. Each
-  assignment writes back to the learned cache, so the same merchant resolves
-  automatically next time. **This feedback loop is the core UX.**
+Two paths into the same pipeline, both always available:
 
-## Seams (pluggable interfaces)
+- **Manual upload** via the dashboard's upload button.
+- **Watched drop folder** (`watchdog`): drop a PDF into a folder and it's
+  auto-imported in the background.
 
-These are the boundaries that must stay clean so backends can be swapped without
-touching unrelated code:
+Both are hash-deduped by `importer.py`, so re-processing the same file is a
+no-op. Because uploads are saved into the watched folder (so both paths share
+one code path), an upload also fires the watcher for the same file; a lock in
+`import_pdf` (and another around `DistilBertCategorizer`'s model-loading
+cache) serializes these so they can't race each other into a duplicate
+import or a concurrent model load.
 
-1. **`StatementParser`** — `pdf bytes -> {rows, printed_total}`. One implementation
-   initially (LLM-based). A deterministic per-bank implementation can be added later
-   without rewiring anything else.
-2. **`Categorizer`** — the overall `string -> category` boundary.
-3. **Model backend** — the single swap point inside the categorizer. Embedding-based
-   (compare a merchant vector against learned-cache vectors) and LLM-based (classify
-   from the descriptor string) are both valid implementations and interchangeable
-   without touching the cache, the normalizer, or the UI.
-4. **Category catalog** — a single canonical list referenced everywhere; never hardcode
-   category strings inline.
+## The model + "All merchants"
 
-## Invariants
+The categorizer is not assumed to be right. Its own accuracy (~72% test
+accuracy / macro F1 on Overture-derived training data, which per prior
+evaluation is close to the ceiling set by label noise in that dataset) means
+some fraction of categorizations will be wrong, so every categorization
+carries a confidence score (the model's softmax probability) alongside it,
+purely as information for a human -- not as a gate.
 
-- **No parse enters the system without passing reconciliation or explicit user
-  override.** This is the safety property that makes LLM-based parsing acceptable for
-  financial data.
-- **Each PDF is parsed by the LLM at most once.** The parse cache keyed by file hash
-  makes re-imports free, offline, and deterministic.
-- **Cache writes (learned categorizer cache) only happen at user assignment time.**
-  Model-driven classifications do not poison the cache without explicit user
-  confirmation.
-- **Each distinct merchant is classified by a model at most once.** The learned cache
-  makes the categorizer model-backend choice low-stakes — cost-bounded,
-  offline-replayable.
-- **MCC codes are not assumed.** They aren't on printed statements; categorization
-  works from descriptor strings only.
+There is no separate confidence-gated review queue: `storage.all_merchants()`
+and the dashboard's "All merchants" browser show *every* purchase merchant,
+always, with its category, confidence (or "confirmed" once a human has set
+it), and total spend, searchable by name. Correcting any merchant writes back
+as `source="user"`, which the source-precedence rule (`seed < model < user`)
+then protects from ever being overwritten by a future model guess for that
+merchant. `DEFAULT_REVIEW_THRESHOLD` in `storage.py` still exists as a
+calibration reference point (see `tests/calibrate_confidence.py`) for how
+much to trust a given confidence value, but nothing in the live app uses it
+to filter what a human can see.
 
-## Honest tradeoffs of this design
+This means the system's accuracy compounds over time: every merchant a human
+looks at is permanently resolved, and only genuinely new merchants ever need
+a second look -- the human just decides when to look, rather than the app
+deciding for them.
 
-- **Parsing requires an LLM-capable backend on first import.** Cache hits and everything
-  post-parse (dashboard, recategorization, review) remain fully offline. The
-  `StatementParser` seam exists specifically so a deterministic fallback can be added
-  if and when this matters.
-- **Per-statement LLM cost is trivial for personal use** (statements are short; pennies
-  per year at expected volume). If volume changes, the cache bounds it.
-- **The reconciliation gate is load-bearing.** If a statement doesn't print a usable
-  total, reconciliation degrades to a weaker check (e.g., row-count sanity) or the
-  statement goes straight to parse review. The system should never silently accept an
-  unreconciled parse.
+## Why no per-issuer parsers, no LLM
 
-## Deferred decisions
+This tool has to work on a stranger's own statement PDF, from their own bank,
+on their own machine -- not just the handful of issuers its own author
+happens to have. That rules out two tempting designs:
 
-The following are intentionally out of scope here and will be addressed in follow-up
-design docs:
+- **Per-issuer parsers** (there used to be `CanadianTireParser`, `SimpliiParser`,
+  `RogersBankParser`, plus a `DeterministicStatementParser`/`AutoStatementParser`
+  escalation tier -- removed). Each one only covers the issuer it was written
+  for; a new user's bank just doesn't work until someone writes a parser for
+  it. That's not a fixable gap, it's the shape of the approach.
+- **An LLM fallback** (there used to be `FuelixStatementParser` and
+  `OllamaStatementParser` in `parser.py` -- also removed, along with the whole
+  file once nothing else used it). Beyond needing an API key or a local model
+  server most users won't have, an LLM extracting dollar amounts can silently
+  drop a row, flip a sign, or grab the wrong printed total -- exactly the kind
+  of error that shouldn't be possible on data where correctness matters to
+  the cent.
 
-- Language / runtime / framework choice
-- PDF text extraction library (the LLM still needs page text; *how* that's pulled from
-  the PDF is a stack decision)
-- Specific model / provider for the LLM parser
-- Database choice and schema
-- Folder structure
-- Test strategy
-- Deployment / packaging
+Instead, `GenericStatementParser` is issuer-agnostic by construction, and the
+one place it used to need issuer-specific knowledge -- recognizing the total
+line's exact wording -- was replaced with the reconciliation-driven scheme
+described above. Verified against 25 real statements across 4 issuers with
+completely different total phrasing, and by masking out every previously-known
+exact phrase to confirm the generic-keyword pass alone (not the fallback list)
+recovers the total (`tests/test_deterministic.py`).
+
+## Explicitly out of scope right now
+
+- **Hosting this for other people**: multi-user auth, a hosted database,
+  discarding raw PDFs for privacy, dropping the drop-folder in favor of
+  upload-only -- all real architecture changes if this ever needs to serve
+  multiple people from one running instance, as opposed to each person running
+  their own local copy. Deferred until the single-instance-per-user case works
+  well.
+
+## Model artifact
+
+The trained model is not checked into git. `DistilBertCategorizer` resolves
+where to load it from, in order:
+
+1. `CC_TOOL_MODEL_PATH`, if set.
+2. `~/.cc_tool/models/distilbert-merchant`, if present locally (e.g. after
+   training via `training/distilbert-uncased-trainer.ipynb` and copying its saved
+   output folder there).
+3. Otherwise, the public Hugging Face Hub repo
+   `categorizer.HF_MODEL_REPO_ID` (currently
+   `Dluvhugging/cc-tool-merchant-distilbert`) -- `transformers` downloads and
+   caches it under `~/.cache/huggingface` on first use, so a fresh install
+   with no local model still categorizes correctly with no setup step.
+
+`DistilBertCategorizer` validates at load time that the model's label set
+matches `categories.CATEGORY_SET`, so a retrained model with a different
+category list fails loudly instead of silently mismatching.
+
+After retraining, push the new weights (and the training data, for
+reproducibility) with `python scripts/push_to_hub.py` -- see that script's
+docstring. The training data itself lives at the dataset repo
+`Dluvhugging/cc-tool-merchant-training-data` on the Hub, sourced from
+`data/cc_merchants_overture.csv` (built by `training/build_overture_dataset.py`,
+which folds in `training/well_known_merchants.py`'s hand corrections).
+
+## Testing
+
+`tests/` has two different things in it:
+
+- **`test_*.py`** (run via `pytest tests/`, needs the `dev` extra --
+  `pip install -e ".[dev]"`): real unit tests against synthetic statement
+  text, not real PDFs -- a real statement is a personal financial document and
+  those were deliberately kept out of the repo. Covers reconciliation
+  (including the refund-handling regression), the reconciliation-driven total
+  detection and its exact-phrase fallback, date disambiguation, the itemized-
+  appendix and total-for-transaction lookahead logic, storage's source
+  precedence, and importer's hash dedup / non-fatal degradation.
+- **`calibrate_confidence.py`**: not a pytest test (no `test_` prefix, not
+  collected). A manual script against 100 hand-labeled real rows
+  (`merchants_gold.csv`) that needs a trained model on disk -- see "Model
+  artifact" above and the script's own docstring.
+
+## Local file locations
+
+| What | Location | Override |
+|---|---|---|
+| SQLite database | `~/.cc_tool/cc_tool.db` | `CC_TOOL_DB` |
+| Merchant cache (CLI, no DB) | `~/.cc_tool/merchant_categories.json` | `CC_TOOL_CACHE` |
+| Model folder | `~/.cc_tool/models/distilbert-merchant` | `CC_TOOL_MODEL_PATH` |
+| Watched drop folder | `~/.cc_tool/inbox` | `cc-tool serve --drop` |

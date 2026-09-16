@@ -1,6 +1,7 @@
 """Reconciliation: verify spending transactions sum to the statement's printed
-purchases total. Payments are excluded — they represent prior-month balance
-repayment, not current spending."""
+purchases total. Only `purchase` rows are compared -- the printed total is the
+issuer's "Purchases" figure, which nets out refunds and excludes payments (both
+represent something other than new purchase spending)."""
 
 from dataclasses import dataclass
 from typing import Optional
@@ -21,7 +22,7 @@ class ReconciliationResult:
 
 
 def reconcile(parse: ParseResult) -> ReconciliationResult:
-    spending_rows = [r for r in parse.rows if r.transaction_type != "payment"]
+    spending_rows = [r for r in parse.rows if r.transaction_type == "purchase"]
     rows_sum = sum(r.amount_cents for r in spending_rows)
 
     if parse.printed_total_cents is None:
