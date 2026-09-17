@@ -14,9 +14,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from dotenv import load_dotenv
 from huggingface_hub import HfApi
 
 from cc_tool.categorizer import HF_MODEL_REPO_ID, default_model_path
+
+load_dotenv()  # so CC_TOOL_MODEL_PATH from .env is honored, same as cli.py
 
 DATASET_REPO_ID = "Dluvhugging/cc-tool-merchant-training-data"
 DATASET_FILE = Path(__file__).resolve().parent.parent / "data" / "cc_merchants_overture.csv"
@@ -26,6 +29,7 @@ def main() -> None:
     api = HfApi()
 
     model_path = default_model_path()
+    print(f"Resolved local model path: {model_path}")
     if not model_path.exists():
         raise SystemExit(f"No local model at {model_path} -- nothing to push.")
 
