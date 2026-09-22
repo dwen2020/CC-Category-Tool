@@ -1,5 +1,4 @@
-"""Pydantic models for parser output. Field descriptions are sent to the model
-as part of the structured-output schema, so phrasing matters."""
+"""Pydantic models for parser output."""
 
 from typing import Literal, Optional
 
@@ -26,6 +25,21 @@ class TransactionRow(BaseModel):
             "Use 'interest' for interest charges."
         )
     )
+    # Assigned by the separate categorization pass (see categorizer.py), never by
+    # the parser. Null until categorized; only 'purchase' rows are ever assigned
+    # a spending category.
+    category: Optional[str] = Field(
+        default=None,
+        description="Spending category from the canonical list, or null.",
+    )
+    # Also assigned by the categorization pass, alongside `category`: the
+    # model's softmax probability for its chosen category. Shown in the "All
+    # merchants" browser (see storage.all_merchants) so a human can judge how
+    # much to trust it.
+    confidence: Optional[float] = Field(
+        default=None,
+        description="Categorization model's confidence in `category`, or null.",
+    )
 
 
 class ParseResult(BaseModel):
@@ -37,7 +51,7 @@ class ParseResult(BaseModel):
         description="Total purchases/charges as printed on the statement (often labeled "
         "'Total Purchases', 'New Charges', or 'Total this period'). "
         "This should be the spending total only — do NOT include payments received. "
-        "Integer cents. Null if the statement does not show one.",
+        "Integer cents. Example: $308.44 → 30844. Null if the statement does not show one.",
     )
     issuer: Optional[str] = Field(
         default=None,

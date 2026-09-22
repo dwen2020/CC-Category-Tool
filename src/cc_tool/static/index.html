@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CC Category Tool</title>
+<style>
+  :root {
+    --bg:#f4f5f7; --card:#ffffff; --card-alt:#ffffff; --line:#e2e5ea;
+    --fg:#1c2126; --muted:#6b7480; --accent:#3b7ddb; --good:#1f9d55; --bad:#d5392f; --warn:#b3730b;
+    --input-bg:#f7f8fa;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui, -apple-system, sans-serif; }
+
+  header {
+    padding:18px 32px; border-bottom:1px solid var(--line);
+    display:flex; align-items:center; gap:20px; flex-wrap:wrap;
+    background:var(--card-alt); position:sticky; top:0; z-index:5;
+    box-shadow:0 1px 2px rgba(20,25,30,.04);
+  }
+  h1 { font-size:16px; margin:0; font-weight:700; letter-spacing:.01em; }
+  .muted { color:var(--muted); }
+  .pill {
+    display:inline-flex; align-items:center; gap:6px; padding:4px 10px;
+    border-radius:999px; background:var(--card); border:1px solid var(--line);
+    font-size:12.5px; color:var(--muted);
+  }
+
+  main { max-width:1080px; margin:0 auto; padding:28px 32px 64px; display:grid; gap:20px; }
+
+  section.tier-primary { display:grid; gap:20px; }
+  section.tier-secondary { margin-top:8px; }
+
+  .card {
+    background:var(--card); border:1px solid var(--line); border-radius:12px; padding:22px;
+    box-shadow:0 1px 3px rgba(20,25,30,.04);
+  }
+  .card.hero { padding:22px 26px; }
+  .card h2 {
+    font-size:13px; text-transform:uppercase; letter-spacing:.07em; color:var(--muted);
+    margin:0 0 16px; font-weight:600;
+  }
+  .card h2 .count { color:var(--fg); font-weight:700; text-transform:none; letter-spacing:0; }
+
+  .hero-row { display:flex; align-items:baseline; justify-content:space-between; flex-wrap:wrap; gap:12px; }
+
+  .bar-row { display:grid; grid-template-columns:128px 1fr 92px; align-items:center; gap:14px; margin:9px 0; }
+  .bar-row .cat-label { display:flex; align-items:center; gap:8px; font-size:13.5px; }
+  .cat-dot { width:9px; height:9px; border-radius:50%; flex:none; }
+  .bar-track { background:var(--input-bg); border-radius:6px; height:16px; overflow:hidden; }
+  .bar-fill { height:100%; border-radius:6px; transition:width .25s ease; }
+  .amt { text-align:right; font-variant-numeric:tabular-nums; }
+
+  .bar-row.clickable { cursor:pointer; padding:4px 6px; margin:2px -6px; border-radius:7px; }
+  .bar-row.clickable:hover { background:var(--input-bg); }
+  .bar-row.clickable.expanded { background:var(--input-bg); }
+  .drilldown { padding:2px 6px 12px 40px; }
+  .drilldown table { font-size:12.5px; }
+  .drilldown .empty { font-size:12.5px; padding:6px 0; display:block; }
+
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; font-size:11.5px; text-transform:uppercase; letter-spacing:.04em; }
+  td.amt, th.amt { text-align:right; }
+  tr:last-child td { border-bottom:none; }
+
+  select, button, input[type=text] {
+    background:var(--input-bg); color:var(--fg); border:1px solid var(--line); border-radius:7px;
+    padding:7px 11px; font:inherit; font-size:13.5px;
+  }
+  button { cursor:pointer; transition:background .15s, border-color .15s; }
+  button:hover { border-color:#b7bec8; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button.tab { background:transparent; }
+  button.tab.active { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+
+  .drop-bar {
+    display:flex; align-items:center; gap:14px; padding:14px 18px;
+    border:1px dashed var(--line); border-radius:10px; color:var(--muted); font-size:13.5px;
+  }
+  .drop-bar strong { color:var(--fg); font-weight:600; }
+
+  .empty { color:var(--muted); font-style:italic; }
+
+  details.secondary summary {
+    cursor:pointer; list-style:none; display:flex; align-items:center; gap:8px;
+    font-size:12.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);
+    padding:10px 4px; user-select:none;
+  }
+  details.secondary summary::-webkit-details-marker { display:none; }
+  details.secondary summary::before { content:"\25B8"; display:inline-block; transition:transform .15s; }
+  details.secondary[open] summary::before { transform:rotate(90deg); }
+  details.secondary[open] > .secondary-body { display:grid; gap:16px; padding-top:8px; }
+
+  .activity-row { padding:5px 0; border-bottom:1px solid var(--line); font-size:13px; }
+  .activity-row:last-child { border-bottom:none; }
+  .stage-tag { text-transform:uppercase; font-size:11px; letter-spacing:.03em; font-weight:600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CC Category Tool</h1>
+  <span class="pill" id="dropinfo"></span>
+  <span class="pill" id="reviewPill" style="display:none"></span>
+  <span class="pill" id="retrainPill" style="display:none"></span>
+  <span class="muted" id="stats" style="margin-left:auto"></span>
+</header>
+<main>
+
+  <section class="tier-primary">
+    <div class="card hero">
+      <div class="hero-row">
+        <div>
+          <div class="muted" style="font-size:12px; text-transform:uppercase; letter-spacing:.05em; margin-bottom:4px;">Average per month</div>
+          <div style="font-size:26px; font-weight:700; letter-spacing:-.01em;" id="avgMonthly">$0.00</div>
+        </div>
+        <div class="drop-bar">
+          Drop PDFs into the watched folder, or
+          <label style="color:var(--accent); cursor:pointer; text-decoration:underline;">
+            <strong>choose files</strong><input type="file" accept="application/pdf" multiple hidden id="file">
+          </label>
+        </div>
+      </div>
+      <div id="uploadmsg" class="muted" style="margin-top:10px; font-size:13px"></div>
+    </div>
+
+    <div class="card">
+      <div class="hero-row" style="margin-bottom:16px;">
+        <h2 style="margin:0">Spending by category</h2>
+        <span class="muted" id="totalsSince" style="font-size:12.5px"></span>
+      </div>
+      <div id="totals"><span class="empty">No data yet.</span></div>
+    </div>
+
+    <div class="card">
+      <div class="hero-row" style="margin-bottom:16px;">
+        <h2 style="margin:0">Monthly view</h2>
+        <select id="monthPicker" style="min-width:120px"></select>
+      </div>
+      <div id="monthBreakdown"><span class="empty">No data yet.</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Merchants</h2>
+      <div style="display:flex; gap:8px; margin-bottom:14px;">
+        <button id="viewReview" class="tab active">Needs review <span id="reviewCount"></span></button>
+        <button id="viewAll" class="tab">All merchants</button>
+      </div>
+      <input type="text" id="merchantSearch" placeholder="Filter by merchant name..." style="width:100%; margin-bottom:14px;">
+      <div id="allMerchants"><span class="empty">Loading...</span></div>
+    </div>
+  </section>
+
+  <section class="tier-secondary">
+    <details class="secondary">
+      <summary>Import activity &amp; statement management</summary>
+      <div class="secondary-body">
+        <div class="card">
+          <h2>By month</h2>
+          <div id="bymonth"><span class="empty">No data yet.</span></div>
+        </div>
+        <div class="card">
+          <h2>Activity</h2>
+          <div id="activity"><span class="empty">Nothing happening yet.</span></div>
+        </div>
+        <div class="card">
+          <h2>Statements</h2>
+          <div id="statements"><span class="empty">No statements yet.</span></div>
+        </div>
+        <div class="card">
+          <h2>Model retraining</h2>
+          <div id="retrainStatus" class="muted"></div>
+          <button id="markRetrained" style="margin-top:12px">Mark as retrained</button>
+        </div>
+      </div>
+    </details>
+  </section>
+
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const money = (c) => "$" + (c/100).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const formatMonth = (ym) => { const [y,m] = ym.split("-"); return MONTH_NAMES[parseInt(m,10)-1] + " " + y; };
+let CATEGORIES = [];
+
+// Stable color per category (by name, not position) so the bar chart and the
+// month pivot table always agree on what color means what.
+const CAT_HUES = {};
+function catColor(cat) {
+  if (!(cat in CAT_HUES)) {
+    const idx = Object.keys(CAT_HUES).length;
+    CAT_HUES[cat] = (idx * 47) % 360; // spread hues apart, not sequential
+  }
+  return `hsl(${CAT_HUES[cat]}, 65%, 58%)`;
+}
+
+async function load() {
+  const s = await (await fetch("/api/summary")).json();
+  CATEGORIES = s.categories;
+  $("dropinfo").textContent = "watching " + s.drop_folder;
+  $("stats").textContent = s.statements + " statements, " + s.transactions + " transactions";
+  await Promise.all([loadTotals(), loadAllMerchants(), loadStatements(), loadRetrainStatus()]);
+}
+
+async function loadRetrainStatus() {
+  const s = await (await fetch("/api/retrain_status")).json();
+  const overThreshold = s.corrections_since >= s.threshold;
+
+  $("retrainPill").style.display = s.corrections_since > 0 ? "inline-flex" : "none";
+  $("retrainPill").innerHTML = `<span style="color:${overThreshold ? "var(--warn)" : "var(--muted)"}">${s.corrections_since} corrections since retrain</span>`;
+
+  const since = s.marked_at ? formatMonth(s.marked_at.slice(0,7)) : "never marked";
+  const note = overThreshold
+    ? `<br><span style="color:var(--warn)">Enough corrections have piled up that a retrain may be worth it.</span>`
+    : "";
+  $("retrainStatus").innerHTML = `${s.corrections_since} correction(s) since last marked retrain (${since}), out of a ${s.threshold}-correction nudge point.${note}`;
+}
+
+$("markRetrained").onclick = async () => {
+  if (!confirm("Mark the model as freshly retrained? This resets the correction counter to zero -- only do this after you've actually retrained and validated a new checkpoint.")) return;
+  await fetch("/api/retrain_status/mark", { method: "POST" });
+  await loadRetrainStatus();
+};
+
+async function loadStatements() {
+  const { rows } = await (await fetch("/api/statements")).json();
+  if (!rows.length) { $("statements").innerHTML = '<span class="empty">No statements yet.</span>'; return; }
+  $("statements").innerHTML = "<table><tr><th>File</th><th>Period</th><th>Reconciled</th><th class='amt'>Txns</th><th></th></tr>" +
+    rows.map(r => {
+      const period = (r.period_start || "?") + " to " + (r.period_end || "?");
+      const reconColor = r.reconciled ? "var(--good)" : "var(--bad)";
+      const reconLabel = r.reconciled ? "yes" : "NO";
+      return `<tr>
+        <td title="${r.file_name}">${r.file_name}</td>
+        <td class="muted">${period}</td>
+        <td style="color:${reconColor}">${reconLabel}</td>
+        <td class="amt">${r.n_transactions}</td>
+        <td><button data-del-statement="${r.id}">Delete</button></td>
+      </tr>`;
+    }).join("") + "</table>";
+  document.querySelectorAll("button[data-del-statement]").forEach(b => b.onclick = deleteStatement);
+}
+
+async function deleteStatement(e) {
+  const id = e.target.dataset.delStatement;
+  if (!confirm("Delete this statement and all its transactions? This cannot be undone.")) return;
+  await fetch(`/api/statements/${id}`, { method: "DELETE" });
+  await Promise.all([loadStatements(), loadTotals(), loadAllMerchants()]);
+}
+
+const STAGE_COLOR = {
+  detected: "var(--muted)", parsing: "var(--accent)", categorizing: "var(--accent)",
+  done: "var(--good)", skipped: "var(--muted)", error: "var(--bad)", warning: "var(--warn)",
+};
+
+async function loadActivity() {
+  const { rows } = await (await fetch("/api/activity")).json();
+  if (!rows.length) { $("activity").innerHTML = '<span class="empty">Nothing happening yet.</span>'; return; }
+  $("activity").innerHTML = rows.slice(0, 12).map(r => {
+    const color = STAGE_COLOR[r.stage] || "var(--fg)";
+    const time = r.ts.includes("T") ? r.ts.split("T")[1] : r.ts;
+    return `<div class="activity-row">
+      <span class="muted">${time}</span>
+      <b>${r.file}</b>
+      <span class="stage-tag" style="color:${color}">${r.stage}</span>
+      ${r.detail ? `<span class="muted"> -- ${r.detail}</span>` : ""}
+    </div>`;
+  }).join("");
+}
+
+let TOTALS_ROWS = [];
+
+async function loadTotals() {
+  const { rows } = await (await fetch("/api/totals")).json();
+  TOTALS_ROWS = rows;
+
+  const agg = {};
+  for (const r of rows) agg[r.category] = (agg[r.category]||0) + r.total_cents;
+  const cats = Object.entries(agg).sort((a,b)=>b[1]-a[1]);
+  const max = Math.max(1, ...cats.map(c=>c[1]));
+
+  const months = [...new Set(rows.map(r=>r.month))].sort();
+  $("totalsSince").textContent = months.length ? "since " + formatMonth(months[0]) : "";
+
+  const grandTotal = cats.reduce((sum, [,c]) => sum + c, 0);
+  $("avgMonthly").textContent = months.length ? money(Math.round(grandTotal / months.length)) + "/mo" : "$0.00/mo";
+
+  $("totals").innerHTML = cats.length ? cats.map(([cat,c]) => {
+    const color = catColor(cat);
+    return `<div class="bar-row">
+       <span class="cat-label"><span class="cat-dot" style="background:${color}"></span>${cat}</span>
+       <div class="bar-track"><div class="bar-fill" style="width:${100*c/max}%; background:${color}"></div></div>
+       <span class="amt">${money(c)}</span></div>`;
+  }).join("") : '<span class="empty">No data yet.</span>';
+
+  const allCats = [...new Set(rows.map(r=>r.category))];
+  const cell = {};
+  for (const r of rows) cell[r.month+"|"+r.category] = r.total_cents;
+  if (months.length) {
+    let html = "<table><tr><th>Category</th>" + months.map(m=>`<th class="amt">${m}</th>`).join("") + "</tr>";
+    for (const cat of allCats) {
+      html += `<tr><td><span class="cat-dot" style="background:${catColor(cat)}; display:inline-block; margin-right:6px;"></span>${cat}</td>` + months.map(m => {
+        const v = cell[m+"|"+cat]; return `<td class="amt">${v?money(v):"-"}</td>`;
+      }).join("") + "</tr>";
+    }
+    html += "</table>";
+    $("bymonth").innerHTML = html;
+  } else {
+    $("bymonth").innerHTML = '<span class="empty">No data yet.</span>';
+  }
+
+  renderMonthPicker(months);
+  renderMonthView();
+}
+
+let SELECTED_MONTH = null;
+let EXPANDED_CATEGORY = null;
+const DRILLDOWN_CACHE = {}; // "month|category" -> rows, cleared whenever a category is saved
+
+function renderMonthPicker(months) {
+  // Don't rebuild the <select> while it's open/focused -- same class of glitch
+  // as the merchant dropdowns (a periodic refresh would snap it closed).
+  if (document.activeElement === $("monthPicker")) return;
+  // Most recent first; keep the current selection if it's still a valid month,
+  // otherwise default to the most recent one.
+  const sorted = [...months].sort().reverse();
+  if (!sorted.length) { $("monthPicker").innerHTML = ""; SELECTED_MONTH = null; return; }
+  if (!SELECTED_MONTH || !sorted.includes(SELECTED_MONTH)) SELECTED_MONTH = sorted[0];
+  $("monthPicker").innerHTML = sorted.map(m => `<option ${m===SELECTED_MONTH?"selected":""}>${m}</option>`).join("");
+}
+$("monthPicker").onchange = (e) => {
+  SELECTED_MONTH = e.target.value;
+  EXPANDED_CATEGORY = null;
+  renderMonthView();
+};
+
+function renderMonthView() {
+  // Don't rebuild mid-interaction -- the periodic refresh would otherwise
+  // yank the drill-down's <select> out from under an open dropdown or a
+  // pending choice, same glitch class as the merchant table's guard.
+  if (document.activeElement && document.activeElement.matches("#monthBreakdown select")) return;
+  if (!SELECTED_MONTH) { $("monthBreakdown").innerHTML = '<span class="empty">No data yet.</span>'; return; }
+  const rows = TOTALS_ROWS.filter(r => r.month === SELECTED_MONTH).sort((a,b) => b.total_cents - a.total_cents);
+  if (!rows.length) { $("monthBreakdown").innerHTML = '<span class="empty">No spending this month.</span>'; return; }
+  const max = Math.max(1, ...rows.map(r => r.total_cents));
+
+  const monthTotal = rows.reduce((sum, r) => sum + r.total_cents, 0);
+
+  $("monthBreakdown").innerHTML = rows.map(r => {
+    const color = catColor(r.category);
+    const isOpen = EXPANDED_CATEGORY === r.category;
+    const barRow = `<div class="bar-row clickable ${isOpen ? "expanded" : ""}" data-drill-cat="${encodeURIComponent(r.category)}">
+       <span class="cat-label"><span class="cat-dot" style="background:${color}"></span>${r.category}</span>
+       <div class="bar-track"><div class="bar-fill" style="width:${100*r.total_cents/max}%; background:${color}"></div></div>
+       <span class="amt">${money(r.total_cents)}</span></div>`;
+    const drillDiv = `<div class="drilldown" id="drill-${encodeURIComponent(r.category)}" style="display:${isOpen?"block":"none"}"><span class="empty">Loading...</span></div>`;
+    return barRow + drillDiv;
+  }).join("") + `<div class="bar-row" style="border-top:1px solid var(--line); margin-top:10px; padding-top:12px; font-weight:600;">
+       <span>Total</span><span></span><span class="amt">${money(monthTotal)}</span></div>`;
+
+  document.querySelectorAll("[data-drill-cat]").forEach(el => el.onclick = toggleDrilldown);
+  if (EXPANDED_CATEGORY) loadDrilldown(EXPANDED_CATEGORY);
+}
+
+function toggleDrilldown(e) {
+  const cat = decodeURIComponent(e.currentTarget.dataset.drillCat);
+  EXPANDED_CATEGORY = EXPANDED_CATEGORY === cat ? null : cat;
+  renderMonthView();
+}
+
+async function loadDrilldown(category) {
+  const key = SELECTED_MONTH + "|" + category;
+  let rows = DRILLDOWN_CACHE[key];
+  if (!rows) {
+    const resp = await (await fetch(`/api/totals/drilldown?month=${encodeURIComponent(SELECTED_MONTH)}&category=${encodeURIComponent(category)}`)).json();
+    rows = resp.rows;
+    DRILLDOWN_CACHE[key] = rows;
+  }
+  const el = $(`drill-${encodeURIComponent(category)}`);
+  if (!el) return; // view moved on since the fetch started
+  if (!rows.length) { el.innerHTML = '<span class="empty">No merchants.</span>'; return; }
+  // Every row here is currently filed under `category` (that's what the query
+  // filtered on), so that's the natural pre-selected value in each dropdown.
+  const opts = CATEGORIES.map(c => `<option ${c===category?"selected":""}>${c}</option>`).join("");
+  el.innerHTML = "<table><tr><th>Merchant</th><th class='amt'>Spent</th><th>Set to</th><th></th></tr>" +
+    rows.map(r => `<tr>
+      <td title="${r.sample}">${r.merchant} <span class="muted">(${r.n})</span></td>
+      <td class="amt">${money(r.total_cents)}</td>
+      <td><select data-dd="${encodeURIComponent(r.merchant)}">${opts}</select></td>
+      <td><button class="primary" data-dd-save="${encodeURIComponent(r.merchant)}">Save</button></td>
+    </tr>`).join("") +
+    "</table>";
+  el.querySelectorAll("button[data-dd-save]").forEach(b => b.onclick = saveDrilldownCategory);
+}
+
+async function saveDrilldownCategory(e) {
+  const merchant = decodeURIComponent(e.target.dataset.ddSave);
+  const sel = document.querySelector(`select[data-dd="${e.target.dataset.ddSave}"]`);
+  await postCategorize(merchant, sel.value);
+  // The merchant may now belong to a different month/category cell than
+  // whatever's cached, and apply_category touches every transaction for this
+  // merchant everywhere (not just the current month), so the whole drill-down
+  // cache -- not just this cell -- can be stale.
+  for (const key of Object.keys(DRILLDOWN_CACHE)) delete DRILLDOWN_CACHE[key];
+  await Promise.all([loadTotals(), loadAllMerchants()]);
+}
+
+async function postCategorize(merchant, category) {
+  await fetch("/api/categorize", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ merchant, category })
+  });
+}
+
+let ALL_MERCHANTS = [];
+let VIEW_MODE = "review"; // "review" | "all"
+const REVIEW_THRESHOLD = 0.5;
+
+// Uncategorized, or a model guess below the threshold -- a user-confirmed
+// merchant is never "needs review" regardless of its stored confidence.
+const needsReview = (r) => r.category == null || (r.source === "model" && r.confidence != null && r.confidence < REVIEW_THRESHOLD);
+
+async function loadAllMerchants() {
+  // Don't yank the table out from under an open dropdown -- the periodic
+  // refresh below would otherwise rebuild #allMerchants mid-click and snap
+  // the <select> closed before a choice can be made.
+  if (document.activeElement && document.activeElement.matches("#allMerchants select")) return;
+  const { rows } = await (await fetch("/api/merchants")).json();
+  ALL_MERCHANTS = rows;
+  renderAllMerchants();
+}
+
+function setViewMode(mode) {
+  VIEW_MODE = mode;
+  $("viewReview").classList.toggle("active", mode === "review");
+  $("viewAll").classList.toggle("active", mode === "all");
+  renderAllMerchants();
+}
+$("viewReview").onclick = () => setViewMode("review");
+$("viewAll").onclick = () => setViewMode("all");
+
+function renderAllMerchants() {
+  const reviewCount = ALL_MERCHANTS.filter(needsReview).length;
+  $("reviewCount").textContent = reviewCount ? "(" + reviewCount + ")" : "";
+  if (reviewCount) {
+    $("reviewPill").style.display = "inline-flex";
+    $("reviewPill").innerHTML = `<span style="color:var(--warn)">${reviewCount} to review</span>`;
+  } else {
+    $("reviewPill").style.display = "none";
+  }
+
+  const q = ($("merchantSearch").value || "").trim().toLowerCase();
+  const base = VIEW_MODE === "review" ? ALL_MERCHANTS.filter(needsReview) : ALL_MERCHANTS;
+  const rows = base.filter(r => !q || r.merchant.toLowerCase().includes(q));
+  if (!rows.length) {
+    const empty = VIEW_MODE === "review" && !q ? "Nothing needs review." : (base.length ? "No merchants match." : "No merchants yet.");
+    $("allMerchants").innerHTML = '<span class="empty">' + empty + '</span>';
+    return;
+  }
+  $("allMerchants").innerHTML = "<table><tr><th>Merchant</th><th class='amt'>Spent</th><th>Category</th><th>Set to</th><th></th></tr>" +
+    rows.map(r => {
+      const opts = CATEGORIES.map(c=>`<option ${c===r.category?"selected":""}>${c}</option>`).join("");
+      let label = "uncategorized";
+      if (r.category) {
+        if (r.source === "user") label = r.category + " (confirmed)";
+        else if (r.confidence != null) label = r.category + ` (${Math.round(r.confidence*100)}%)`;
+        else label = r.category;
+      }
+      return `<tr>
+      <td title="${r.sample}">${r.merchant} <span class="muted">(${r.n})</span></td>
+      <td class="amt">${money(r.total_cents)}</td>
+      <td class="muted">${label}</td>
+      <td><select data-am="${encodeURIComponent(r.merchant)}">${opts}</select></td>
+      <td><button class="primary" data-am-save="${encodeURIComponent(r.merchant)}">Save</button></td>
+    </tr>`;
+    }).join("") + "</table>";
+  document.querySelectorAll("button[data-am-save]").forEach(b => b.onclick = saveAllMerchantCategory);
+}
+
+async function saveAllMerchantCategory(e) {
+  const merchant = decodeURIComponent(e.target.dataset.amSave);
+  const sel = document.querySelector(`select[data-am="${e.target.dataset.amSave}"]`);
+  await postCategorize(merchant, sel.value);
+  // apply_category touches every transaction for this merchant across every
+  // month it appears in, so any cached drill-down cell could now be stale --
+  // not just cells for the month currently selected in the Monthly view.
+  for (const key of Object.keys(DRILLDOWN_CACHE)) delete DRILLDOWN_CACHE[key];
+  await Promise.all([loadTotals(), loadAllMerchants()]);
+}
+
+$("merchantSearch").oninput = renderAllMerchants;
+
+$("file").onchange = async (e) => {
+  for (const f of e.target.files) {
+    $("uploadmsg").textContent = "Importing " + f.name + "...";
+    loadActivity();
+    const fd = new FormData(); fd.append("file", f);
+    const o = await (await fetch("/api/upload", { method:"POST", body: fd })).json();
+    $("uploadmsg").textContent = `${o.file_name}: ${o.status} (${o.detail})`;
+  }
+  // A new import can add transactions into any month/category cell.
+  for (const key of Object.keys(DRILLDOWN_CACHE)) delete DRILLDOWN_CACHE[key];
+  await Promise.all([load(), loadActivity()]);
+};
+
+load();
+loadActivity();
+setInterval(load, 5000);       // pick up files dropped into the watched folder
+setInterval(loadActivity, 1000);  // faster refresh: import stages move quickly
+</script>
+</body>
+</html>
