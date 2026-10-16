@@ -46,18 +46,30 @@ extra setup step. If you'd rather use your own locally-trained model, point
 
 ## Usage
 
+**The web dashboard is the main way to use cc-tool -- most people only ever
+need this one command:**
+
+```
+cc-tool serve
+```
+
+This starts a UI at `http://127.0.0.1:8765` and watches `~/.cc_tool/inbox`
+(override with `--drop`): drop a statement PDF in there, or use the upload
+button in the dashboard, and it's parsed, categorized, and stored
+automatically. From the dashboard you can see spending by category over
+time, browse every merchant it's seen, and correct a miscategorized one with
+a click.
+
+The rest of the CLI exists alongside it for scripting or terminal use, and
+reads/writes the exact same local data as the dashboard:
+
 ```
 cc-tool parse statement.pdf          # parse one PDF, print extracted rows
 cc-tool import statement.pdf         # parse + categorize + store it
 cc-tool import ~/Statements/         # import every PDF in a folder
 cc-tool report                       # spending by category, by month
 cc-tool set "some merchant" Dining   # correct/pin a merchant's category
-cc-tool serve                        # local web dashboard + watched drop folder
 ```
-
-`cc-tool serve` starts a dashboard at `http://127.0.0.1:8765` and watches
-`~/.cc_tool/inbox` (override with `--drop`) -- drop a statement PDF in there
-and it's imported automatically.
 
 ## Data
 
