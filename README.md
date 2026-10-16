@@ -27,7 +27,11 @@ work out).
 
 ## Install
 
+This isn't published to PyPI, so grab the source first:
+
 ```
+git clone https://github.com/dwen2020/CC-Category-Tool.git
+cd CC-Category-Tool
 pip install .
 ```
 
