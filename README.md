@@ -5,7 +5,25 @@ categories -- especially useful if you have several different credit cards.
 
 Runs entirely on your machine: no account, no cloud dependency, no API key
 required. It turns your statements into an accumulating, categorized spending
-history. See `ARCHITECTURE.md` for how it works internally.
+history.
+
+- Parses statement PDFs from any issuer -- there's no per-bank code, and no
+  LLM in the parsing path (see "Why no per-issuer parsers, no LLM" in
+  `ARCHITECTURE.md`).
+- Checks every parsed statement against its own printed total before trusting
+  it; anything that doesn't reconcile is still stored, but flagged for you to
+  look at rather than silently accepted.
+- Categorizes each purchase into one of twelve spending categories (Groceries,
+  Dining, Transport, Travel, Shopping, Utilities, Health, Entertainment, Home,
+  Services, Financial, Other) using a small local model -- any correction you
+  make is remembered permanently for that merchant.
+- A local web dashboard shows spending by category over time, plus a
+  searchable list of every merchant it's seen.
+- A watched drop folder auto-imports new statements, or upload them by hand.
+
+See `ARCHITECTURE.md` for how it works internally, and `BUILDING.md` for the
+story of how it got to this design (including the approaches that didn't
+work out).
 
 ## Install
 

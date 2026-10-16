@@ -8,6 +8,11 @@ version = "0.0.1"
 description = "Local credit-card statement categorization tool"
 readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
+authors = [
+  { name = "dwen2020" },
+]
+urls.Repository = "https://github.com/dwen2020/CC-Category-Tool"
 dependencies = [
   "pdfplumber",
   "pydantic>=2.0",
